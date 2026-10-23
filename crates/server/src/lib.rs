@@ -9,6 +9,7 @@
 pub mod admin;
 pub mod api;
 pub mod release;
+pub mod storage;
 pub mod store;
 
 use std::path::Path;
@@ -25,6 +26,9 @@ pub struct App {
     /// The onion address clients pin; bundles and OPAQUE logins bind to it.
     pub server_name: String,
     pub pow_difficulty: u8,
+    /// Whether the admin page may restart this process (only the real
+    /// binary sets this; tests embed the server and must not exec).
+    pub restartable: std::sync::atomic::AtomicBool,
 }
 
 impl App {
@@ -37,6 +41,7 @@ impl App {
             store: Store::open(data_dir)?,
             server_name: server_name.to_owned(),
             pow_difficulty,
+            restartable: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 }
@@ -79,4 +84,24 @@ pub async fn serve(app: Arc<App>, public: UnixListener, admin: TcpListener) -> s
     };
     sweeper.abort();
     result
+}
+
+/// Replaces this process with a fresh copy of the same program and
+/// arguments (same PID, so systemd keeps tracking it). Picks up a newly
+/// installed binary. Returns only if exec failed.
+pub fn restart_in_place() -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // After the binary was replaced, Linux reports "<path> (deleted)".
+    let exe = exe
+        .to_str()
+        .and_then(|p| p.strip_suffix(" (deleted)"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or(exe);
+    std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .exec()
 }

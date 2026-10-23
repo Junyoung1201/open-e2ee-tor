@@ -24,8 +24,8 @@ use serde::Deserialize;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-use crate::App;
 use crate::store::{AdminSession, Status, now_secs, write_private};
+use crate::{App, storage};
 
 const COOKIE: &str = "o2ee_admin";
 const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
@@ -45,6 +45,8 @@ pub fn router(app: Arc<App>, port: u16) -> Router {
         .route("/login", get(login_page).post(login))
         .route("/logout", post(logout))
         .route("/action", post(action))
+        .route("/storage", post(save_storage))
+        .route("/restart", post(restart))
         .fallback(|| async { (StatusCode::NOT_FOUND, "Not found") })
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
@@ -250,6 +252,7 @@ async fn login(State(s): State<AdminState>, body: Bytes) -> Response {
         AdminSession {
             csrf: hex::encode(random_bytes::<32>()),
             expires: now + SESSION_TTL,
+            flash: None,
         },
     );
     let cookie = format!(
@@ -364,28 +367,63 @@ async fn dashboard(State(s): State<AdminState>, headers: HeaderMap) -> Response 
         .map(|x| x.username.clone())
         .collect();
 
-    let mut body = String::from("<header><h1>o2ee admin</h1>");
+    let mut body = String::from("<header><h1>o2ee admin</h1><div class=\"actions\">");
     let _ = write!(
         body,
-        "<form method=\"post\" action=\"/logout\" class=\"inline\">\
-         <input type=\"hidden\" name=\"csrf\" value=\"{}\"><button>Log out</button></form></header>",
-        esc(&csrf)
+        "<form method=\"post\" action=\"/restart\" class=\"inline\">\
+         <input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button>Restart server</button></form>\
+         <form method=\"post\" action=\"/logout\" class=\"inline\">\
+         <input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button>Log out</button></form></div></header>",
+        csrf = esc(&csrf)
     );
+    if let Some(msg) = take_flash(&s, &headers) {
+        let _ = write!(body, "<p class=\"flash\">{}</p>", esc(&msg));
+    }
 
     let waiting: u64 = p.transfers.values().map(|t| t.size).sum();
-    let free = rustix::fs::statvfs(store.dir())
+    let free = rustix::fs::statvfs(store.files_dir())
         .map(|v| v.f_bavail.saturating_mul(v.f_frsize))
         .unwrap_or(0);
+    let config = storage::load(store.dir()).unwrap_or_default();
+    let shown = config
+        .next_storage_dir
+        .clone()
+        .unwrap_or_else(|| store.files_dir().to_owned());
+    let mut storage_notes = String::new();
+    if let Some(next) = &config.next_storage_dir {
+        let _ = write!(
+            storage_notes,
+            "<p class=\"warn\">Pending: files will move from <code>{}</code> to <code>{}</code> \
+             when the server restarts.</p>",
+            esc(&store.files_dir().display().to_string()),
+            esc(&next.display().to_string())
+        );
+    }
+    if let Some(err) = &config.storage_error {
+        let _ = write!(storage_notes, "<p class=\"warn\">{}</p>", esc(err));
+    }
     let _ = write!(
         body,
         "<section><h2>Server</h2><dl>\
          <dt>Onion address</dt><dd><code>{}</code></dd>\
          <dt>Waiting transfers</dt><dd>{} ({})</dd>\
-         <dt>Free disk</dt><dd>{}</dd></dl></section>",
+         <dt>Free disk</dt><dd>{}</dd>\
+         <dt>Storage</dt><dd>\
+         <form method=\"post\" action=\"/storage\" class=\"storage\">\
+         <input type=\"hidden\" name=\"csrf\" value=\"{}\">\
+         <input name=\"path\" value=\"{}\" aria-label=\"Storage folder\" spellcheck=\"false\" required>\
+         <button>Save</button></form>\
+         <p class=\"muted\">Encrypted transfer files are kept in this folder. If you change it, \
+         the files are moved to the new folder and the server switches to it the next time \
+         the server restarts. Accounts and keys stay in <code>{}</code>.</p>{storage_notes}\
+         </dd></dl></section>",
         esc(&s.app.server_name),
         p.transfers.len(),
         mb(waiting),
-        mb(free)
+        mb(free),
+        esc(&csrf),
+        esc(&shown.display().to_string()),
+        esc(&store.dir().display().to_string()),
     );
 
     body.push_str("<section><h2>Signup requests</h2>");
@@ -462,4 +500,116 @@ async fn dashboard(State(s): State<AdminState>, headers: HeaderMap) -> Response 
     }
     body.push_str("</section>");
     page("o2ee admin", &body).into_response()
+}
+
+fn set_flash(s: &AdminState, headers: &HeaderMap, message: String) {
+    if let Some(token) = cookie_value(headers)
+        && let Some(a) = s.app.store.memory().admin_sessions.get_mut(&token)
+    {
+        a.flash = Some(message);
+    }
+}
+
+fn take_flash(s: &AdminState, headers: &HeaderMap) -> Option<String> {
+    let token = cookie_value(headers)?;
+    s.app
+        .store
+        .memory()
+        .admin_sessions
+        .get_mut(&token)?
+        .flash
+        .take()
+}
+
+/// Checks the session and the form's CSRF token.
+fn authorized<T: serde::de::DeserializeOwned>(
+    s: &AdminState,
+    headers: &HeaderMap,
+    body: &Bytes,
+    csrf_of: impl Fn(&T) -> &str,
+) -> Result<T, Box<Response>> {
+    let Some(csrf) = session(s, headers) else {
+        return Err(Box::new(Redirect::to("/login").into_response()));
+    };
+    let Some(form) = parse_form::<T>(body) else {
+        return Err(Box::new(
+            (StatusCode::BAD_REQUEST, "Invalid request").into_response(),
+        ));
+    };
+    if !csrf_ok(&csrf, csrf_of(&form)) {
+        return Err(Box::new(
+            (StatusCode::FORBIDDEN, "Forbidden").into_response(),
+        ));
+    }
+    Ok(form)
+}
+
+#[derive(Deserialize)]
+struct StorageForm {
+    csrf: String,
+    path: String,
+}
+
+/// Records a new storage folder; it takes effect on the next restart.
+async fn save_storage(State(s): State<AdminState>, headers: HeaderMap, body: Bytes) -> Response {
+    let form = match authorized::<StorageForm>(&s, &headers, &body, |f| &f.csrf) {
+        Ok(f) => f,
+        Err(r) => return *r,
+    };
+    let store = &s.app.store;
+    let message = match storage::check_new(&form.path, store.dir(), store.files_dir()) {
+        Err(e) => e,
+        Ok(path) => {
+            let mut config = storage::load(store.dir()).unwrap_or_default();
+            let same = store.files_dir().canonicalize().ok().as_deref() == Some(path.as_path());
+            config.next_storage_dir = (!same).then(|| path.clone());
+            config.storage_error = None;
+            match storage::save(store.dir(), &config) {
+                Err(e) => format!("Could not save: {e}"),
+                Ok(()) if same => "Storage folder unchanged.".to_owned(),
+                Ok(()) => format!(
+                    "Saved. Restart the server to move the files to {}.",
+                    path.display()
+                ),
+            }
+        }
+    };
+    set_flash(&s, &headers, message);
+    Redirect::to("/").into_response()
+}
+
+#[derive(Deserialize)]
+struct CsrfOnly {
+    csrf: String,
+}
+
+/// Restarts the server process in place. Sessions are in memory only, so
+/// everyone, including this admin, has to log in again.
+async fn restart(State(s): State<AdminState>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Err(r) = authorized::<CsrfOnly>(&s, &headers, &body, |f| &f.csrf) {
+        return *r;
+    }
+    if !s.app.restartable.load(std::sync::atomic::Ordering::Relaxed) {
+        set_flash(
+            &s,
+            &headers,
+            "Restart is not available when the server runs embedded.".into(),
+        );
+        return Redirect::to("/").into_response();
+    }
+    tokio::spawn(async {
+        // Let this response reach the browser first.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = crate::restart_in_place();
+    });
+    Html(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta http-equiv=\"refresh\" content=\"6;url=/login\">\
+         <title>Restarting</title><link rel=\"stylesheet\" href=\"/style.css\"></head>\
+         <body><main><h1>Restarting...</h1>\
+         <p>The server is restarting. This page opens the login page in a few seconds.</p>\
+         <p class=\"muted\">All sessions end, so clients and you need to log in again.</p>\
+         </main></body></html>",
+    )
+    .into_response()
 }

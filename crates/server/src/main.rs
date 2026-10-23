@@ -120,6 +120,8 @@ fn run(command: Command) -> Result<(), String> {
             runtime.block_on(async {
                 let app = App::open(&data_dir, &name, o2ee_protocol::crypto::pow::DIFFICULTY)
                     .map_err(|e| format!("Cannot open data dir: {e}"))?;
+                app.restartable
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 let public =
                     bind_public(&socket).map_err(|e| format!("Cannot bind socket: {e}"))?;
                 let admin = tokio::net::TcpListener::bind(("127.0.0.1", admin_port))

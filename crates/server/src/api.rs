@@ -443,7 +443,7 @@ async fn account(
 // ------------------------------------------------------------- transfers
 
 fn disk_free(app: &App) -> u64 {
-    rustix::fs::statvfs(app.store.dir())
+    rustix::fs::statvfs(app.store.files_dir())
         .map(|s| s.f_bavail.saturating_mul(s.f_frsize))
         .unwrap_or(0)
 }

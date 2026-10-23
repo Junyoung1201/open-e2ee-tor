@@ -92,6 +92,8 @@ impl Failures {
 pub struct AdminSession {
     pub csrf: String,
     pub expires: Instant,
+    /// One-time message for the next dashboard view.
+    pub flash: Option<String>,
 }
 
 #[derive(Default)]
@@ -110,6 +112,7 @@ pub const LOGIN_STATE_TTL: Duration = Duration::from_secs(120);
 
 pub struct Store {
     dir: PathBuf,
+    files: PathBuf,
     persist: Mutex<Persist>,
     memory: Mutex<Memory>,
     pub setup: ServerSetup<Suite>,
@@ -161,7 +164,7 @@ pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
 impl Store {
     pub fn open(dir: &Path) -> std::io::Result<Self> {
         private_dir(dir)?;
-        private_dir(&dir.join("files"))?;
+        let files = crate::storage::prepare(dir)?;
 
         let setup_path = dir.join("opaque_setup.bin");
         let setup = match fs::read(&setup_path) {
@@ -182,9 +185,9 @@ impl Store {
             Err(e) => return Err(e),
         };
 
-        // Resume points come from the files themselves; files without a
-        // record (e.g. after a crash) are removed.
-        let files = dir.join("files");
+        // Resume points come from the files themselves; transfer files
+        // without a record (e.g. after a crash) are removed. Nothing else in
+        // the storage folder is ever touched.
         for (id, t) in persist.transfers.iter_mut() {
             t.received = fs::metadata(files.join(format!("{id}.bin")))
                 .map(|m| m.len().min(t.size))
@@ -196,17 +199,19 @@ impl Store {
         for entry in fs::read_dir(&files)? {
             let entry = entry?;
             let name = entry.file_name();
-            let keep = name
-                .to_str()
-                .and_then(|n| n.strip_suffix(".bin"))
-                .is_some_and(|id| persist.transfers.contains_key(id));
-            if !keep {
+            let Some(name) = name.to_str() else { continue };
+            let orphan = crate::storage::is_transfer_file(name)
+                && name
+                    .strip_suffix(".bin")
+                    .is_some_and(|id| !persist.transfers.contains_key(id));
+            if orphan {
                 let _ = fs::remove_file(entry.path());
             }
         }
 
         let store = Self {
             dir: dir.to_owned(),
+            files,
             persist: Mutex::new(persist),
             memory: Mutex::new(Memory::default()),
             setup,
@@ -220,8 +225,13 @@ impl Store {
         &self.dir
     }
 
+    /// Folder holding transfer ciphertext (see `storage`).
+    pub fn files_dir(&self) -> &Path {
+        &self.files
+    }
+
     pub fn file_path(&self, id: &str) -> PathBuf {
-        self.dir.join("files").join(format!("{id}.bin"))
+        self.files.join(format!("{id}.bin"))
     }
 
     pub fn persist(&self) -> MutexGuard<'_, Persist> {

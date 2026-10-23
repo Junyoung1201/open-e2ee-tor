@@ -19,8 +19,13 @@ fn name(n: &str) -> Username {
 }
 
 fn files_on_server(server: &TestServer) -> usize {
-    std::fs::read_dir(server.data_dir().join("files"))
+    std::fs::read_dir(server.app.store.files_dir())
         .unwrap()
+        .filter(|e| {
+            o2ee_server::storage::is_transfer_file(
+                &e.as_ref().unwrap().file_name().to_string_lossy(),
+            )
+        })
         .count()
 }
 

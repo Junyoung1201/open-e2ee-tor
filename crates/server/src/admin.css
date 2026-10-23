@@ -7,9 +7,10 @@ header { display: flex; justify-content: space-between; align-items: center; }
 h1 { font-size: 1.4rem; margin: 0 0 16px; }
 h2 { font-size: 1.05rem; margin: 0 0 12px; }
 section { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin: 16px 0; overflow-x: auto; }
-dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 0; }
+dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 16px; margin: 0; align-items: baseline; }
 dt { color: var(--muted); }
-dd { margin: 0; }
+dd { margin: 0; min-width: 0; }
+dd code { overflow-wrap: anywhere; }
 table { border-collapse: collapse; width: 100%; }
 th, td { text-align: left; padding: 6px 8px; border-top: 1px solid var(--line); vertical-align: middle; }
 th { color: var(--muted); font-weight: 500; border-top: none; }
@@ -23,3 +24,9 @@ input { font: inherit; padding: 4px 8px; border: 1px solid var(--line); border-r
 button { font: inherit; padding: 4px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--fg); cursor: pointer; }
 button.ok { border-color: var(--ok); color: var(--ok); }
 button.danger { border-color: var(--danger); color: var(--danger); }
+.actions { display: flex; gap: 4px; flex-wrap: wrap; }
+.flash { border: 1px solid var(--line); background: var(--card); border-radius: 8px; padding: 8px 12px; }
+form.storage { display: flex; gap: 6px; flex-wrap: wrap; margin: 0; }
+form.storage input { flex: 1 1 220px; min-width: 0; font: 13px ui-monospace, monospace; }
+dd p { margin: 6px 0 0; font-size: 0.9rem; }
+@media (max-width: 560px) { dl { grid-template-columns: minmax(0, 1fr); gap: 2px; } dd { margin-bottom: 8px; } }
