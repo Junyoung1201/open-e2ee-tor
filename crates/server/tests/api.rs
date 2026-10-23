@@ -930,3 +930,41 @@ async fn files_and_state_are_private() {
     sorted.sort();
     assert_eq!(sorted, ["files", "opaque_setup.bin", "state.json"]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_login_works_with_browser_headers() {
+    let t = start().await;
+    o2ee_server::admin::set_admin_password(t.app.store.dir(), "correct horse admin").unwrap();
+    // The page must not make browsers send `Origin: null` on its forms.
+    let r = admin(&t, Method::GET, "/login", &[], "").await;
+    assert_eq!(r.headers.get("referrer-policy").unwrap(), "same-origin");
+    // What a browser sends for the same-origin login form.
+    let origin = format!("http://127.0.0.1:{}", t.admin_port);
+    let browser = [
+        form(),
+        ("origin", origin.as_str()),
+        ("sec-fetch-site", "same-origin"),
+    ];
+    let r = admin(
+        &t,
+        Method::POST,
+        "/login",
+        &browser,
+        "password=correct+horse+admin",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER);
+    assert!(r.headers.get("set-cookie").is_some());
+    let r = admin(&t, Method::POST, "/login", &browser, "password=wrong").await;
+    assert!(String::from_utf8_lossy(&r.body).contains("Wrong password"));
+    // Opaque origins (sandboxed frames, data: pages) stay refused.
+    let r = admin(
+        &t,
+        Method::POST,
+        "/login",
+        &[form(), ("origin", "null")],
+        "password=correct+horse+admin",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+}

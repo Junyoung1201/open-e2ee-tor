@@ -92,7 +92,10 @@ async fn guard(State(s): State<AdminState>, req: Request, next: Next) -> Respons
         ),
         ("x-frame-options", "DENY"),
         ("x-content-type-options", "nosniff"),
-        ("referrer-policy", "no-referrer"),
+        // Not "no-referrer": under that policy browsers send `Origin: null`
+        // on form posts, which the Origin check above must refuse. Nothing
+        // is sent to other sites either way.
+        ("referrer-policy", "same-origin"),
         ("cache-control", "no-store"),
     ] {
         h.insert(name, HeaderValue::from_static(value));
