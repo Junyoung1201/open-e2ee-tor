@@ -1,0 +1,62 @@
+[workspace]
+resolver = "3"
+members = ["crates/protocol", "crates/server", "crates/client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+o2ee-protocol = { path = "crates/protocol" }
+clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+opaque-ke = { version = "4.0.1", default-features = false, features = ["ristretto255", "argon2", "std"] }
+age = { version = "0.12.1", default-features = false }
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
+argon2 = { version = "0.5", features = ["std"] }
+sha2 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+zeroize = { version = "1.9.1", features = ["derive"] }
+subtle = "2.6.1"
+base64 = "0.23.1"
+hex = "0.4.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "fs", "time", "sync", "signal"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "form", "query", "json"] }
+hyper = { version = "1.12.0", features = ["client", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+http-body-util = "0.1.5"
+bytes = "1.12.1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+arti-client = { version = "0.47.0", default-features = false, features = ["tokio", "rustls", "compression", "onion-service-client", "static-sqlite"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tor-rtcompat = { version = "0.47.0", default-features = false, features = ["tokio", "rustls"] }
+rpassword = "7.5.4"
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
+rustix = { version = "1.1.5", features = ["process", "net", "fs"] }
+serde_urlencoded = "0.7"
+minisign-verify = "0.3"
+minisign = { version = "0.10", default-features = false }
+tokio-util = { version = "0.7", features = ["io"] }
+dirs = "7.0.0"
+tempfile = "3.27.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+print_stdout = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true

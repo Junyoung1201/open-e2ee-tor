@@ -1,0 +1,7 @@
+# Build output
+/target
+/.runtime
+
+# Local working notes (not published)
+PLAN.txt
+AGENTS.md

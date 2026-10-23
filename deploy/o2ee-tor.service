@@ -1,0 +1,16 @@
+[Unit]
+Description=Tor onion service for o2ee-server
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/tor -f %h/.config/o2ee-server/torrc
+StandardOutput=null
+StandardError=null
+LimitCORE=0
+UMask=0077
+NoNewPrivileges=yes
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

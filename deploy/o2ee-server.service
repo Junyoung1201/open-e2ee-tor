@@ -1,0 +1,24 @@
+[Unit]
+Description=o2ee-server (onion API and local admin page)
+After=o2ee-tor.service
+Wants=o2ee-tor.service
+
+[Service]
+# Tor writes the onion hostname on first start; wait for it.
+ExecStartPre=/bin/sh -c 'i=0; while [ ! -s "$HOME/.local/share/o2ee-server/hs/hostname" ]; do i=$((i+1)); [ $i -gt 120 ] && exit 1; sleep 1; done'
+ExecStart=%h/.local/bin/o2ee-server run \
+    --data-dir %h/.local/share/o2ee-server/data \
+    --socket %h/.local/share/o2ee-server/run/public.sock \
+    --onion-hostname-file %h/.local/share/o2ee-server/hs/hostname \
+    --admin-port 8788
+# No-log: nothing is kept. Run the ExecStart line by hand to diagnose.
+StandardOutput=null
+StandardError=null
+LimitCORE=0
+UMask=0077
+NoNewPrivileges=yes
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

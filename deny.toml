@@ -1,0 +1,31 @@
+# cargo deny check   (cargo install --locked cargo-deny)
+[graph]
+all-features = false
+
+[advisories]
+yanked = "deny"
+# Unmaintained notices only fail for crates we depend on directly.
+unmaintained = "workspace"
+ignore = [
+    # rsa "Marvin" timing side channel on RSA *decryption/signing*. Pulled in
+    # by Arti's key store (ssh-key). The o2ee client never does private RSA
+    # operations an attacker can time; Tor clients only verify RSA.
+    { id = "RUSTSEC-2023-0071", reason = "no private RSA operations in a Tor client" },
+]
+
+[licenses]
+allow = [
+    "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause",
+    "ISC", "Unicode-3.0", "Zlib", "CC0-1.0", "BSL-1.0",
+    # File-level copyleft / public domain, used by Arti and dirs.
+    "MPL-2.0", "Unlicense",
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

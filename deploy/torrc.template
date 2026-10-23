@@ -1,0 +1,23 @@
+# Tor instance that publishes the o2ee onion service. Runs as your user
+# (systemd user service o2ee-tor), separate from any system tor.
+# @BASE@ is replaced by install.sh.
+
+DataDirectory @BASE@/tor-data
+# Server only: no SOCKS or control port, no relaying.
+SocksPort 0
+ControlPort 0
+ClientOnly 1
+AvoidDiskWrites 1
+
+# No-log: errors only, to stderr, which systemd discards.
+Log err stderr
+SafeLogging 1
+
+HiddenServiceDir @BASE@/hs
+HiddenServicePort 80 unix:@BASE@/run/public.sock
+# DoS defences: proof-of-work under load (Tor clients solve it
+# automatically) and intro-point rate limits.
+HiddenServicePoWDefensesEnabled 1
+HiddenServiceEnableIntroDoSDefense 1
+HiddenServiceMaxStreams 64
+HiddenServiceMaxStreamsCloseCircuit 1
