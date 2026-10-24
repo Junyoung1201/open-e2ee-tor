@@ -43,7 +43,7 @@ o2ee-server set-admin-password --data-dir ~/.local/share/o2ee-server/data
 minisign -G -p ~/o2ee-release.pub -s /media/user/USB/o2ee-release.key
 
 # 여기서 ~/o2ee-release.pub는 공개 키 파일 경로이고
-# o2ee-release.key는 릴리스 서명용 개인 키로, 서버 컴퓨터가 아닌 곳에 안전하게 보관합니다.
+# o2ee-release.key는 릴리스 서명용 개인 키로, 서버 컴퓨터가 아닌 곳에 안전하게 보관해야 합니다.
 ```
 
 버전 변경, 빌드, 서명, 게시를 한 번에 합니다. 개인 키 비밀번호는 터미널에서 묻습니다.
