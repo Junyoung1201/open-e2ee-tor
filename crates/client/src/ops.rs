@@ -34,7 +34,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use zeroize::Zeroizing;
 
 use crate::Error;
-use crate::net::{Net, read_small, server_error};
+use crate::net::{Net, STALL_TIMEOUT, read_small, server_error};
 use crate::paths::{Paths, private_dir, write_private};
 
 pub const MIN_PASSWORD_CHARS: usize = 10;
@@ -635,9 +635,9 @@ impl Session {
             file.seek(SeekFrom::Start(offset))
                 .and_then(|_| file.read_exact(&mut chunk))
                 .map_err(|e| local_io(sealed, e))?;
-            let sent = self
+            let outcome = self
                 .net
-                .send(
+                .send_watched(
                     Method::PUT,
                     &format!("/v1/transfers/{id}/data?offset={offset}"),
                     Some(&self.token),
@@ -646,12 +646,9 @@ impl Session {
                         ("content-type", "application/octet-stream".to_owned()),
                     ],
                     Bytes::from(chunk),
+                    |sent| reporter.update(offset + sent),
                 )
                 .await;
-            let outcome = match sent {
-                Ok(res) => read_small(res).await,
-                Err(e) => Err(e),
-            };
             match outcome {
                 Ok((status, body)) if status.is_success() || status == StatusCode::CONFLICT => {
                     let received = serde_json::from_slice::<UploadState>(&body)
@@ -663,6 +660,12 @@ impl Session {
                                 failures = 0;
                             }
                             offset = r;
+                        }
+                        // The server may still hold the slot of a request
+                        // that died on the way; it frees it after a while.
+                        Err(_) if status == StatusCode::CONFLICT && failures < RETRIES => {
+                            failures += 1;
+                            tokio::time::sleep(Duration::from_secs(1 << failures.min(4))).await;
                         }
                         _ if status == StatusCode::CONFLICT => {
                             return Err(server_error(status, &body));
@@ -683,7 +686,11 @@ impl Session {
                         return Err(Error::Network("Upload failed after several retries".into()));
                     }
                     tokio::time::sleep(Duration::from_secs(1 << failures.min(4))).await;
-                    offset = self.upload_state(id, key).await.unwrap_or(offset);
+                    offset = tokio::time::timeout(STALL_TIMEOUT, self.upload_state(id, key))
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or(offset);
                 }
                 Err(e) => return Err(e),
             }

@@ -4,16 +4,21 @@
 //! is no TLS. Every response is size-capped before it is parsed, and every
 //! error message from the server is sanitised before it is shown.
 
+use std::convert::Infallible;
 use std::path::Path;
 #[cfg(debug_assertions)]
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use arti_client::config::TorClientConfigBuilder;
 use arti_client::{TorClient, TorClientConfig};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
-use hyper::body::Incoming;
+use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::header::{self, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -22,9 +27,17 @@ use o2ee_protocol::text::sanitize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::time::Instant;
 use tor_rtcompat::PreferredRuntime;
 
 use crate::Error;
+
+/// A watched request fails when no body bytes have gone out and no reply
+/// has come back for this long. A Tor stream can die without closing.
+pub const STALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Request bodies are handed to the connection in pieces of this size, so
+/// the bytes sent so far can be counted.
+const BODY_PIECE: usize = 64 * 1024;
 
 trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
@@ -115,14 +128,90 @@ impl Net {
     }
 
     /// Sends one request on a fresh stream.
-    pub async fn send(
+    pub fn send(
         &self,
         method: Method,
         path: &str,
         token: Option<&str>,
         headers: &[(&str, String)],
         body: Bytes,
-    ) -> Result<Response<Incoming>, Error> {
+    ) -> impl Future<Output = Result<Response<Incoming>, Error>> + Send {
+        // Not an `async fn`: an extra layer here makes the CLI's future too
+        // deep for the compiler.
+        self.send_body(method, path, token, headers, Full::new(body))
+    }
+
+    /// Sends one request and reads a small reply, reporting the body bytes
+    /// sent so far to `on_sent`. Fails with [`Error::Network`] if nothing
+    /// moves for [`STALL_TIMEOUT`].
+    pub async fn send_watched(
+        &self,
+        method: Method,
+        path: &str,
+        token: Option<&str>,
+        headers: &[(&str, String)],
+        body: Bytes,
+        on_sent: impl FnMut(u64),
+    ) -> Result<(StatusCode, Bytes), Error> {
+        self.send_watched_with(method, path, token, headers, body, on_sent, STALL_TIMEOUT)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_watched_with(
+        &self,
+        method: Method,
+        path: &str,
+        token: Option<&str>,
+        headers: &[(&str, String)],
+        body: Bytes,
+        mut on_sent: impl FnMut(u64),
+        stall: Duration,
+    ) -> Result<(StatusCode, Bytes), Error> {
+        let sent = Arc::new(AtomicU64::new(0));
+        let body = Counted {
+            data: body,
+            handed: 0,
+            sent: Arc::clone(&sent),
+        };
+        let request = async {
+            let res = self.send_body(method, path, token, headers, body).await?;
+            read_small(res).await
+        };
+        tokio::pin!(request);
+        let mut tick = tokio::time::interval(Duration::from_millis(200));
+        let mut last = 0;
+        let mut moved = Instant::now();
+        loop {
+            tokio::select! {
+                outcome = &mut request => return outcome,
+                _ = tick.tick() => {
+                    let now = sent.load(Ordering::Relaxed);
+                    if now != last {
+                        last = now;
+                        moved = Instant::now();
+                        on_sent(now);
+                    } else if moved.elapsed() >= stall {
+                        return Err(Error::Network("Server stopped responding".into()));
+                    }
+                }
+            }
+        }
+    }
+
+    async fn send_body<B>(
+        &self,
+        method: Method,
+        path: &str,
+        token: Option<&str>,
+        headers: &[(&str, String)],
+        body: B,
+    ) -> Result<Response<Incoming>, Error>
+    where
+        B: Body + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         // Tor circuits fail now and then. Retrying is safe only before any
         // request bytes have left, so only opening the stream is retried.
         let mut attempt = 0;
@@ -146,7 +235,7 @@ impl Net {
             .method(method)
             .uri(path)
             .header(header::HOST, &self.server)
-            .body(Full::new(body))
+            .body(body)
             .map_err(|_| Error::Protocol("Bad request".into()))?;
         let h = req.headers_mut();
         if let Some(token) = token {
@@ -201,6 +290,41 @@ impl Net {
     }
 }
 
+/// A request body that records how much of it the connection has taken.
+/// A piece counts as sent once the next one is asked for.
+struct Counted {
+    data: Bytes,
+    handed: u64,
+    sent: Arc<AtomicU64>,
+}
+
+impl Body for Counted {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        let this = self.get_mut();
+        this.sent.store(this.handed, Ordering::Relaxed);
+        if this.data.is_empty() {
+            return Poll::Ready(None);
+        }
+        let piece = this.data.split_to(this.data.len().min(BODY_PIECE));
+        this.handed += piece.len() as u64;
+        Poll::Ready(Some(Ok(Frame::data(piece))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.data.len() as u64)
+    }
+}
+
 /// Reads a whole response body of at most [`MAX_JSON_BODY`] bytes.
 pub async fn read_small(res: Response<Incoming>) -> Result<(StatusCode, Bytes), Error> {
     let status = res.status();
@@ -219,5 +343,48 @@ pub fn server_error(status: StatusCode, body: &[u8]) -> Error {
     Error::Server {
         status: status.as_u16(),
         message,
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use tokio::io::AsyncReadExt;
+
+    use super::*;
+
+    /// A server that takes the whole body and never answers, like a Tor
+    /// stream that died without closing.
+    #[tokio::test]
+    async fn stalled_request_fails_and_reports_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 64 * 1024];
+            while stream.read(&mut buf).await.unwrap_or(0) > 0 {}
+        });
+        let net = Net::direct(&socket, "test.onion");
+        let total = 4 * BODY_PIECE;
+        let mut seen = Vec::new();
+        let result = net
+            .send_watched_with(
+                Method::PUT,
+                "/",
+                None,
+                &[],
+                Bytes::from(vec![0u8; total]),
+                |n| seen.push(n),
+                Duration::from_secs(1),
+            )
+            .await;
+        assert!(matches!(result, Err(Error::Network(_))), "{result:?}");
+        assert!(seen.windows(2).all(|w| w[0] < w[1]), "{seen:?}");
+        assert!(
+            seen.last().is_some_and(|n| *n > 0 && *n <= total as u64),
+            "{seen:?}"
+        );
     }
 }

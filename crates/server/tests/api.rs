@@ -968,3 +968,41 @@ async fn admin_login_works_with_browser_headers() {
     .await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn stalled_upload_frees_its_slot() {
+    use tokio::io::AsyncWriteExt;
+    let t = start().await;
+    let alice = t.user("alice").await;
+    t.user("bob").await;
+    let (id, r) = t.create(&alice, "bob", MIB).await;
+    let key = r.json::<CreateTransferReply>().upload_key;
+
+    // A request that promises a body, sends a little and then goes quiet,
+    // like a Tor stream that died without closing.
+    let mut stuck = tokio::net::UnixStream::connect(&t.socket).await.unwrap();
+    let head = format!(
+        "PUT /v1/transfers/{id}/data?offset=0 HTTP/1.1\r\nhost: {SERVER}\r\n\
+         authorization: Bearer {alice}\r\n{UPLOAD_KEY_HEADER}: {key}\r\n\
+         content-length: 1000\r\n\r\n"
+    );
+    stuck.write_all(head.as_bytes()).await.unwrap();
+    stuck.write_all(&[1; 10]).await.unwrap();
+    loop {
+        let r = t.put(&alice, &id, &key, 0, vec![7; 10]).await;
+        if r.error() == "Upload in progress" {
+            break;
+        }
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // The server gives up on it and the client can carry on.
+    tokio::time::pause();
+    tokio::time::sleep(std::time::Duration::from_secs(61)).await;
+    tokio::time::resume();
+    let r = t.put(&alice, &id, &key, 0, vec![7; 10]).await;
+    assert_eq!(r.json::<UploadState>().received, 10);
+    assert_eq!(file_len(&t.file(&id)), 10);
+    drop(stuck);
+}

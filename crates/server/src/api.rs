@@ -40,6 +40,10 @@ use crate::store::{
 
 /// Space kept free on the server's disk no matter what.
 const DISK_RESERVE: u64 = 1024 * MIB;
+/// An upload request that sends nothing for this long is dropped, so a
+/// dead stream does not hold the transfer's upload slot. Shorter than the
+/// client's stall timeout, so the slot is free when the client retries.
+const UPLOAD_IDLE: Duration = Duration::from_secs(60);
 /// Each account's waiting transfers may use this much ciphertext (the
 /// plaintext limit plus age overhead).
 const PENDING_CIPHERTEXT_LIMIT: u64 = MAX_PENDING_BYTES_PER_ACCOUNT + 4 * MIB;
@@ -594,7 +598,10 @@ async fn upload_data(
     let mut stream = body.into_data_stream();
     let mut written = 0u64;
     let mut failed = false;
-    while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = tokio::time::timeout(UPLOAD_IDLE, stream.next())
+        .await
+        .unwrap_or(Some(Err(axum::Error::new("idle"))))
+    {
         let Ok(chunk) = chunk else {
             failed = true;
             break;
