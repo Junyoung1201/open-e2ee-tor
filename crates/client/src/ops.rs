@@ -41,6 +41,19 @@ pub const MIN_PASSWORD_CHARS: usize = 10;
 /// Ciphertext prefix fetched to read a transfer's header.
 const PEEK_BYTES: u64 = 128 * 1024;
 const RETRIES: u32 = 5;
+/// Tor circuits differ a lot in speed. A download that gets less than
+/// this in a window moves to a new circuit and resumes there.
+const SLOW: SpeedRule = SpeedRule {
+    window: Duration::from_secs(30),
+    min_bytes: 2 * 1024 * 1024,
+};
+/// After this many circuit changes the speed is accepted as it is, and
+/// only a complete stall ends the request.
+const MAX_CIRCUIT_CHANGES: u32 = 3;
+const STALLED: SpeedRule = SpeedRule {
+    window: STALL_TIMEOUT,
+    min_bytes: 1,
+};
 
 /// Client-side password policy; the server never sees the password.
 pub fn check_password_strength(password: &str, id: &Username) -> Result<(), Error> {
@@ -885,6 +898,7 @@ impl Session {
     ) -> Result<(), Error> {
         let mut reporter = Reporter::new(progress, Phase::Downloading, total);
         let mut failures = 0;
+        let mut changes = 0;
         loop {
             let have = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
             if have > total {
@@ -895,13 +909,26 @@ impl Session {
             if have == total {
                 return Ok(());
             }
-            let result = self.fetch_from(id, part, have, total, &mut reporter).await;
+            let rule = if changes < MAX_CIRCUIT_CHANGES {
+                SLOW
+            } else {
+                STALLED
+            };
+            let result = self
+                .fetch_from(id, part, have, total, &mut reporter, rule)
+                .await;
             match result {
-                Ok(()) => failures = 0,
-                Err(Error::Network(_)) if failures < RETRIES => {
+                Ok(Fetched::Complete) => failures = 0,
+                Ok(Fetched::TooSlow) if changes < MAX_CIRCUIT_CHANGES => {
+                    changes += 1;
+                    self.net.new_circuit();
+                }
+                Ok(Fetched::TooSlow) | Err(Error::Network(_)) if failures < RETRIES => {
                     failures += 1;
+                    self.net.new_circuit();
                     tokio::time::sleep(Duration::from_secs(1 << failures.min(4))).await;
                 }
+                Ok(Fetched::TooSlow) => return Err(Error::Network("Download stalled".into())),
                 Err(e) => return Err(e),
             }
         }
@@ -914,17 +941,20 @@ impl Session {
         have: u64,
         total: u64,
         reporter: &mut Reporter,
-    ) -> Result<(), Error> {
-        let res = self
-            .net
-            .send(
+        rule: SpeedRule,
+    ) -> Result<Fetched, Error> {
+        let res = tokio::time::timeout(
+            STALL_TIMEOUT,
+            self.net.send(
                 Method::GET,
                 &format!("/v1/transfers/{id}/data"),
                 Some(&self.token),
                 &[("range", format!("bytes={have}-"))],
                 Bytes::new(),
-            )
-            .await?;
+            ),
+        )
+        .await
+        .map_err(|_| Error::Network("Server stopped responding".into()))??;
         let status = res.status();
         if status != StatusCode::PARTIAL_CONTENT {
             let (status, body) = read_small(res).await?;
@@ -945,24 +975,69 @@ impl Session {
             .mode(0o600)
             .open(part)
             .map_err(|e| local_io(part, e))?;
-        let mut body = res.into_body();
         let mut got = have;
-        while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(|e| Error::Network(format!("Download interrupted: {e}")))?;
-            if let Ok(data) = frame.into_data() {
-                got += data.len() as u64;
-                if got > total {
-                    return Err(Error::Protocol("Server sent too much data".into()));
-                }
-                file.write_all(&data).map_err(|e| local_io(part, e))?;
-                reporter.update(got);
+        let fetched = receive(res.into_body(), rule, |data| {
+            got += data.len() as u64;
+            if got > total {
+                return Err(Error::Protocol("Server sent too much data".into()));
             }
-        }
+            file.write_all(&data).map_err(|e| local_io(part, e))?;
+            reporter.update(got);
+            Ok(())
+        })
+        .await;
+        // What arrived is kept either way and the next request resumes.
         file.sync_data().map_err(|e| local_io(part, e))?;
-        if got < total {
-            return Err(Error::Network("Download interrupted".into()));
+        match fetched? {
+            Fetched::Complete if got < total => Err(Error::Network("Download interrupted".into())),
+            fetched => Ok(fetched),
         }
-        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SpeedRule {
+    window: Duration,
+    min_bytes: u64,
+}
+
+#[derive(Debug, PartialEq)]
+enum Fetched {
+    /// The server finished sending.
+    Complete,
+    /// Less than the rule's minimum arrived in a window.
+    TooSlow,
+}
+
+/// Passes a response body to `sink` piece by piece, giving up with
+/// [`Fetched::TooSlow`] when a window brings too little.
+async fn receive(
+    mut body: hyper::body::Incoming,
+    rule: SpeedRule,
+    mut sink: impl FnMut(Bytes) -> Result<(), Error>,
+) -> Result<Fetched, Error> {
+    let mut window_end = tokio::time::Instant::now() + rule.window;
+    let mut window_bytes = 0u64;
+    loop {
+        match tokio::time::timeout_at(window_end, body.frame()).await {
+            Ok(None) => return Ok(Fetched::Complete),
+            Ok(Some(frame)) => {
+                let frame =
+                    frame.map_err(|e| Error::Network(format!("Download interrupted: {e}")))?;
+                if let Ok(data) = frame.into_data() {
+                    window_bytes += data.len() as u64;
+                    sink(data)?;
+                }
+            }
+            Err(_) => {}
+        }
+        if tokio::time::Instant::now() >= window_end {
+            if window_bytes < rule.min_bytes {
+                return Ok(Fetched::TooSlow);
+            }
+            window_end = tokio::time::Instant::now() + rule.window;
+            window_bytes = 0;
+        }
     }
 }
 
@@ -1245,5 +1320,96 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["a.txt", "sub/", "sub/b.txt"]);
+    }
+
+    /// A fake server that answers with `len` bytes, written in pieces of
+    /// `piece` bytes with `pause` between them.
+    #[cfg(debug_assertions)]
+    async fn trickle(
+        dir: &Path,
+        len: usize,
+        piece: usize,
+        pause: Duration,
+    ) -> hyper::body::Incoming {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let socket = dir.join("s.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap_or_else(|e| panic!("{e}"));
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let head = format!("HTTP/1.1 206 Partial Content\r\ncontent-length: {len}\r\n\r\n");
+            let _ = stream.write_all(head.as_bytes()).await;
+            let mut sent = 0;
+            while sent < len {
+                let n = piece.min(len - sent);
+                if piece == 0 || stream.write_all(&vec![7u8; n]).await.is_err() {
+                    break;
+                }
+                sent += n;
+                tokio::time::sleep(pause).await;
+            }
+            // Keep the stream open, like a slow or dead circuit.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let net = Net::direct(&socket, "test.onion");
+        net.send(Method::GET, "/", None, &[], Bytes::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_body()
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn slow_download_is_given_up() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let body = trickle(dir.path(), 100_000, 10, Duration::from_millis(50)).await;
+        let rule = SpeedRule {
+            window: Duration::from_millis(500),
+            min_bytes: 1000,
+        };
+        let mut got = 0;
+        let r = receive(body, rule, |d| {
+            got += d.len();
+            Ok(())
+        })
+        .await;
+        assert_eq!(r.ok(), Some(Fetched::TooSlow));
+        // What arrived before giving up was still passed on.
+        assert!(got > 0 && got < 1000, "{got}");
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn fast_download_completes() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let body = trickle(dir.path(), 300_000, 64 * 1024, Duration::from_millis(1)).await;
+        let rule = SpeedRule {
+            window: Duration::from_millis(500),
+            min_bytes: 1000,
+        };
+        let mut got = 0;
+        let r = receive(body, rule, |d| {
+            got += d.len();
+            Ok(())
+        })
+        .await;
+        assert_eq!(r.ok(), Some(Fetched::Complete));
+        assert_eq!(got, 300_000);
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn stalled_download_is_given_up() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let body = trickle(dir.path(), 1000, 0, Duration::ZERO).await;
+        let rule = SpeedRule {
+            window: Duration::from_millis(300),
+            min_bytes: 1,
+        };
+        let r = receive(body, rule, |_| Ok(())).await;
+        assert_eq!(r.ok(), Some(Fetched::TooSlow));
     }
 }

@@ -9,13 +9,13 @@ use std::path::Path;
 #[cfg(debug_assertions)]
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use arti_client::config::TorClientConfigBuilder;
-use arti_client::{TorClient, TorClientConfig};
+use arti_client::{IsolationToken, StreamPrefs, TorClient, TorClientConfig};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Body, Frame, Incoming, SizeHint};
@@ -54,6 +54,9 @@ enum Transport {
 pub struct Net {
     transport: Transport,
     server: String,
+    /// Streams with the same token share a Tor circuit; a new token makes
+    /// the next stream build a new one. Shared by all clones.
+    circuit: Arc<Mutex<IsolationToken>>,
 }
 
 impl std::fmt::Debug for Net {
@@ -71,6 +74,7 @@ impl Net {
             return Ok(Self {
                 transport: Transport::Direct(PathBuf::from(socket)),
                 server: server.to_owned(),
+                circuit: Arc::new(Mutex::new(IsolationToken::new())),
             });
         }
         crate::paths::private_dir(tor_dir)?;
@@ -87,6 +91,7 @@ impl Net {
         Ok(Self {
             transport: Transport::Tor(client),
             server: server.to_owned(),
+            circuit: Arc::new(Mutex::new(IsolationToken::new())),
         })
     }
 
@@ -97,6 +102,7 @@ impl Net {
         Self {
             transport: Transport::Direct(socket.to_owned()),
             server: server.to_owned(),
+            circuit: Arc::new(Mutex::new(IsolationToken::new())),
         }
     }
 
@@ -108,11 +114,19 @@ impl Net {
         matches!(self.transport, Transport::Tor(_))
     }
 
+    /// Makes the following requests use a new Tor circuit, for when the
+    /// current one is slow. Requests already under way keep theirs.
+    pub fn new_circuit(&self) {
+        *self.circuit.lock().unwrap_or_else(|e| e.into_inner()) = IsolationToken::new();
+    }
+
     async fn connect(&self) -> Result<Box<dyn Io>, Error> {
         match &self.transport {
             Transport::Tor(client) => {
+                let mut prefs = StreamPrefs::new();
+                prefs.set_isolation(*self.circuit.lock().unwrap_or_else(|e| e.into_inner()));
                 let stream = client
-                    .connect((self.server.as_str(), 80))
+                    .connect_with_prefs((self.server.as_str(), 80), &prefs)
                     .await
                     .map_err(|e| Error::Network(format!("Cannot reach server: {e}")))?;
                 Ok(Box::new(stream))
