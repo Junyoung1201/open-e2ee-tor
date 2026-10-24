@@ -38,11 +38,29 @@ o2ee-server set-admin-password --data-dir ~/.local/share/o2ee-server/data
 
 ## 릴리스
 
+최초 한 번 키를 외부 USB나 안전한 저장장치에 보관합니다.
 ```
-deploy/make-release.sh <onion 주소> <minisign.pub>
-minisign -Sm manifest.json <바이너리>       # 오프라인 컴퓨터에서
-o2ee-server publish-release --data-dir <데이터 폴더> --from <서명한 폴더>
+minisign -G -p ~/o2ee-release.pub -s /media/user/USB/o2ee-release.key
+
+# 여기서 ~/o2ee-release.pub는 공개 키 파일 경로이고
+# o2ee-release.key는 릴리스 서명용 개인 키로, 서버 컴퓨터가 아닌 곳에 안전하게 보관합니다.
 ```
+
+버전 변경, 빌드, 서명, 게시를 한 번에 합니다. 개인 키 비밀번호는 터미널에서 묻습니다.
+```
+deploy/make-release.sh \
+  --onion "<onion 주소>" \
+  --pub ~/o2ee-release.pub \
+  --key /media/user/USB/o2ee-release.key \
+  --server-data-dir ~/.local/share/o2ee-server/data \
+  --version "0.1.0" \
+  --name "o2ee-x86_64-linux"
+```
+
+- `--version`은 이미 게시한 버전보다 높아야 하며, `Cargo.toml`과 `Cargo.lock`에 반영되므로 커밋합니다.
+- `--name`은 생략하면 `o2ee-<CPU>-<OS>`입니다.
+- `--key`를 빼면 빌드까지만, `--server-data-dir`을 빼면 서명까지만 합니다(서명을 오프라인 컴퓨터에서 할 때).
+- 결과물은 `target/o2ee-release/`에 남습니다.
 
 ## 개발
 
