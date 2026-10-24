@@ -2910,7 +2910,7 @@ dependencies = [
 
 [[package]]
 name = "o2ee"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "age",
  "arti-client",
@@ -2944,7 +2944,7 @@ dependencies = [
 
 [[package]]
 name = "o2ee-protocol"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "age",
  "base64 0.23.1",
@@ -2964,7 +2964,7 @@ dependencies = [
 
 [[package]]
 name = "o2ee-server"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "argon2",
  "axum",
