@@ -11,6 +11,18 @@ ignore = [
     # by Arti's key store (ssh-key). The o2ee client never does private RSA
     # operations an attacker can time; Tor clients only verify RSA.
     { id = "RUSTSEC-2023-0071", reason = "no private RSA operations in a Tor client" },
+    # crypto-bigint 0.5 timing side channels; fixed only in 0.7.6. Pulled in
+    # through elliptic-curve 0.13 by opaque-ke/voprf (generic traits) and by
+    # age -> hpke/p256. o2ee runs OPAQUE on Ristretto255 and age with x25519
+    # and scrypt only, so no secret ever goes through crypto-bigint. Drop this
+    # once age and opaque-ke move to elliptic-curve 0.14.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint not used on secrets (Ristretto255/x25519 only)" },
+    # Bundled SQLite < 3.54 WAL page-size bug. Arti's tor-dirmgr pins
+    # rusqlite < 0.41 even in 0.48. Exploiting it needs crafted db and -wal
+    # files inside the user's own 0700 Arti cache dir, i.e. an attacker who
+    # can already write the user's files. Drop this once Arti allows
+    # rusqlite 0.41.
+    { id = "RUSTSEC-2026-0459", reason = "needs write access to the user's own Arti cache dir" },
 ]
 
 [licenses]
