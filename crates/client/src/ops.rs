@@ -1322,6 +1322,57 @@ mod tests {
         assert_eq!(names, ["a.txt", "sub/", "sub/b.txt"]);
     }
 
+    /// Every local header's ZIP64 sizes must be real values. zip 9.0.5 left
+    /// 0xFFFF_FFFF_FFFF_FFFF in folder entries, which strict readers reject.
+    #[test]
+    fn zip64_local_headers_have_real_sizes() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let src = dir.path().join("src");
+        fs::create_dir_all(src.join("sub/deeper")).unwrap_or_else(|e| panic!("{e}"));
+        fs::write(src.join("a.txt"), "A").unwrap_or_else(|e| panic!("{e}"));
+        fs::write(src.join("sub/b.txt"), "BB").unwrap_or_else(|e| panic!("{e}"));
+        let out = dir.path().join("out.zip");
+        zip_dir(&src, &out).unwrap_or_else(|e| panic!("{e}"));
+        let bytes = fs::read(&out).unwrap_or_else(|e| panic!("{e}"));
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(&bytes[..]))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let u16_at = |p: usize| u16::from_le_bytes([bytes[p], bytes[p + 1]]);
+        let mut checked = 0;
+        for i in 0..z.len() {
+            let f = z.by_index(i).unwrap_or_else(|e| panic!("{e}"));
+            let (is_dir, size) = (f.is_dir(), f.size());
+            let name = f.name().map(|n| n.into_owned()).unwrap_or_default();
+            let h = usize::try_from(f.header_start()).unwrap_or(usize::MAX);
+            assert_eq!(&bytes[h..h + 4], b"PK\x03\x04", "{name}");
+            let name_len = usize::from(u16_at(h + 26));
+            let extra_len = usize::from(u16_at(h + 28));
+            let mut p = h + 30 + name_len;
+            let end = p + extra_len;
+            while p + 4 <= end {
+                let (id, len) = (u16_at(p), usize::from(u16_at(p + 2)));
+                if id == 0x0001 {
+                    assert!(len >= 16, "{name}: short ZIP64 field");
+                    let field = |o: usize| {
+                        let mut b = [0u8; 8];
+                        b.copy_from_slice(&bytes[p + 4 + o..p + 12 + o]);
+                        u64::from_le_bytes(b)
+                    };
+                    let (plain, packed) = (field(0), field(8));
+                    assert_ne!(plain, u64::MAX, "{name}: placeholder size");
+                    assert_ne!(packed, u64::MAX, "{name}: placeholder size");
+                    if is_dir {
+                        assert_eq!((plain, packed), (0, 0), "{name}");
+                    } else {
+                        assert_eq!(plain, size, "{name}");
+                    }
+                    checked += 1;
+                }
+                p += 4 + len;
+            }
+        }
+        assert_eq!(checked, z.len(), "every entry carries ZIP64 sizes");
+    }
+
     /// A fake server that answers with `len` bytes, written in pieces of
     /// `piece` bytes with `pause` between them.
     #[cfg(debug_assertions)]
