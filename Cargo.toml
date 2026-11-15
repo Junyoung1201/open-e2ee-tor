@@ -37,7 +37,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tor-rtcompat = { version = "0.47.0", default-features = false, features = ["tokio", "rustls"] }
 rpassword = "7.5.4"
 zip = { version = "9.5.0", default-features = false, features = ["deflate"] }
-rustix = { version = "1.1.5", features = ["process", "net", "fs"] }
+rustix = { version = "1.1.6", features = ["process", "net", "fs"] }
 serde_urlencoded = "0.7"
 minisign-verify = "0.3"
 minisign = { version = "0.10", default-features = false }
